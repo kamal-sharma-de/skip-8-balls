@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { GameState, PlayerStats, SurfaceNumber, Particle } from '../types';
+import { GameState, PlayerStats, SurfaceNumber, Particle, LifetimeStats } from '../types';
 import { GRAVITY, AIR_RESISTANCE, SURFACE_Y_OFFSET, generateSurfaceNumber, randomRange } from '../utils/gameUtils';
+import { soundManager } from '../utils/sound';
 
 const CANVAS_WIDTH = 1200;
 const CANVAS_HEIGHT = 600;
@@ -19,6 +20,45 @@ export default function GameCanvas() {
   const [showTutorial, setShowTutorial] = useState(true);
   const [showRules, setShowRules] = useState(false);
   const [diveEffect, setDiveEffect] = useState<{x: number, y: number, id: number} | null>(null);
+  
+  const [lifetimeStats, setLifetimeStats] = useState<LifetimeStats>({
+      totalDistance: 0,
+      totalSkips: 0,
+      totalScore: 0,
+      highScore: 0,
+      maxDistance: 0,
+      gamesPlayed: 0
+  });
+
+  // Load stats
+  useEffect(() => {
+      const saved = localStorage.getItem('stoneSkipperStats');
+      if (saved) {
+          try {
+              setLifetimeStats(JSON.parse(saved));
+          } catch (e) {
+              console.error("Failed to load stats", e);
+          }
+      }
+  }, []);
+
+  // Save stats on Game Over
+  useEffect(() => {
+      if (gameState === 'GAME_OVER') {
+          setLifetimeStats(prev => {
+              const newStats = {
+                  totalDistance: prev.totalDistance + stats.distance,
+                  totalSkips: prev.totalSkips + stats.skips,
+                  totalScore: prev.totalScore + stats.score,
+                  highScore: Math.max(prev.highScore, stats.score),
+                  maxDistance: Math.max(prev.maxDistance, stats.distance),
+                  gamesPlayed: prev.gamesPlayed + 1
+              };
+              localStorage.setItem('stoneSkipperStats', JSON.stringify(newStats));
+              return newStats;
+          });
+      }
+  }, [gameState]);
 
   // Mutable Game Objects (Refs for performance in loop)
   const playerRef = useRef({
@@ -41,6 +81,31 @@ export default function GameCanvas() {
 
   const surfaceRef = useRef<SurfaceNumber[]>([]);
   const particlesRef = useRef<Particle[]>([]);
+  
+  // Floating Text System
+  interface FloatingText {
+      x: number;
+      y: number;
+      text: string;
+      color: string;
+      life: number;
+      vy: number;
+      size: number;
+  }
+  const floatingTextsRef = useRef<FloatingText[]>([]);
+
+  const createFloatingText = (x: number, y: number, text: string, color: string, size: number = 20) => {
+      floatingTextsRef.current.push({
+          x,
+          y,
+          text,
+          color,
+          life: 1.0,
+          vy: -2,
+          size
+      });
+  };
+
   const cameraRef = useRef({ x: 0, y: 0, shake: 0 });
   const inputRef = useRef({ isDragging: false, startX: 0, startY: 0, currentX: 0, currentY: 0 });
   const timeRef = useRef(0);
@@ -59,10 +124,10 @@ export default function GameCanvas() {
   const resetRun = () => {
     playerRef.current = {
       x: 100,
-      y: CANVAS_HEIGHT - SURFACE_Y_OFFSET - 30,
+      y: CANVAS_HEIGHT - SURFACE_Y_OFFSET - 30, // Sit on top of plank (plank is at surfaceY - 10)
       vx: 0,
       vy: 0,
-      radius: 25,
+      radius: 20 + (playerStatsRef.current.weight * 5), // Scale size with weight
       rotation: 0,
       vr: 0,
     };
@@ -74,10 +139,35 @@ export default function GameCanvas() {
     setGameState('AIMING');
   };
 
-  // Initialize Surface on Mount
+  // Load Data
   useEffect(() => {
-      initSurface();
-  }, [initSurface]);
+    const saved = localStorage.getItem('skipball_save_v1');
+    if (saved) {
+        try {
+            const data = JSON.parse(saved);
+            setStats(prev => ({ ...prev, currency: data.currency || 0 }));
+            if (data.upgrades) {
+                playerStatsRef.current = { ...playerStatsRef.current, ...data.upgrades };
+            }
+        } catch (e) {
+            console.error("Save load failed", e);
+        }
+    }
+  }, []);
+
+  // Save Data
+  useEffect(() => {
+      const save = () => {
+          const data = {
+              currency: stats.currency,
+              upgrades: playerStatsRef.current
+          };
+          localStorage.setItem('skipball_save_v1', JSON.stringify(data));
+      };
+      // Debounce save slightly or just save on key events
+      const timeout = setTimeout(save, 1000);
+      return () => clearTimeout(timeout);
+  }, [stats.currency, playerStatsRef.current]); // Save when money or upgrades change
 
   // Game Loop
   const update = useCallback(() => {
@@ -135,29 +225,10 @@ export default function GameCanvas() {
       p.x += p.vx;
       p.y += p.vy;
 
-      // Camera Follow X
-      const targetCamX = p.x - 200;
-      cameraRef.current.x += (targetCamX - cameraRef.current.x) * 0.1;
-      if (cameraRef.current.x < 0) cameraRef.current.x = 0;
-
-      // Camera Follow Y (Aggressive Tracking)
-      // If player goes above the top 30% of screen, move camera up immediately
-      const screenY = p.y - cameraRef.current.y;
-      const topMargin = CANVAS_HEIGHT * 0.3;
-      
-      if (screenY < topMargin) {
-          // Player is too high, move camera up
-          cameraRef.current.y += (screenY - topMargin) * 0.2;
-      } else if (screenY > CANVAS_HEIGHT * 0.6 && cameraRef.current.y < 0) {
-          // Player is low and camera is high, move camera down (but not past 0)
-          cameraRef.current.y += (screenY - CANVAS_HEIGHT * 0.6) * 0.1;
-          if (cameraRef.current.y > 0) cameraRef.current.y = 0;
-      }
-
-      // Shake Decay
-      if (cameraRef.current.shake > 0) {
-          cameraRef.current.shake *= 0.9;
-          if (cameraRef.current.shake < 0.5) cameraRef.current.shake = 0;
+      // Speed Trail
+      const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+      if (speed > 20 && Math.random() > 0.5) {
+          createParticles(p.x, p.y, 1, '#6366f1'); // Indigo trail
       }
 
       // Surface Collision / Generation
@@ -187,8 +258,17 @@ export default function GameCanvas() {
             // Optimization: only check nearby
             if (num.x < p.x - 100 || num.x > p.x + 100) continue;
 
-            // Calculate target position (including bobbing)
-            const numY = surfaceY + Math.sin(timeRef.current + num.x) * 3;
+            // Calculate target position (including bobbing and movement)
+            let numY = surfaceY + Math.sin(timeRef.current + num.x) * 3;
+            if (num.isMoving) {
+                numY += Math.sin(timeRef.current * 2 + num.x) * (num.moveRange || 50);
+            }
+            
+            // Ghost Logic (Skip collision if invisible)
+            if (num.type === 'GHOST') {
+                const ghostOpacity = 0.5 + Math.sin(timeRef.current * 3 + num.x) * 0.4;
+                if (ghostOpacity < 0.3) continue;
+            }
             
             const dx = p.x - num.x;
             const dy = p.y - numY;
@@ -202,32 +282,85 @@ export default function GameCanvas() {
                 const impactVelocity = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
                 const impactForce = impactVelocity * playerStatsRef.current.weight * playerStatsRef.current.value;
                 const resistance = num.value * num.weight;
+                
+                // Smash Mechanic: If force is much higher than resistance, we crush it!
+                const isSmash = impactForce > resistance * 3;
 
                 if (impactForce > resistance || num.type === 'COIN') {
                     // SKIP!
-                    // Bounce off the target
-                    // Simple bounce: invert Y and add some lift
-                    p.vy = -Math.abs(p.vy) * playerStatsRef.current.bounciness;
-                    p.vy -= 2; // Extra pop
                     
-                    // Prevent sinking into the ball
-                    const overlap = minDist - dist;
-                    p.y -= overlap; // Push out
+                    // Multi-Hit Logic
+                    if (num.type === 'MULTI_HIT' && !isSmash && (num.hitsRequired || 0) > 1) {
+                        num.hitsRequired = (num.hitsRequired || 1) - 1;
+                        
+                        // Bounce off
+                        p.vy = -Math.abs(p.vy) * playerStatsRef.current.bounciness;
+                        p.vy -= 2;
+                        const overlap = minDist - dist;
+                        p.y -= overlap;
+                        
+                        // Visuals for hit
+                        createParticles(p.x, numY, 5, num.color);
+                        createFloatingText(p.x, p.y - 30, "HIT!", '#fff', 20);
+                        soundManager.playTargetHit('block');
+                        
+                        break; // Stop processing this target for this frame
+                    }
 
-                    // Friction
-                    // Reduced friction to keep momentum (was max(0.5, ...))
-                    const friction = Math.max(0.8, 1 - (resistance / (impactForce * 5)));
-                    p.vx *= friction;
-                    p.vr = p.vx * 0.1;
+                    if (isSmash && num.type !== 'COIN') {
+                         // SMASH THROUGH!
+                         // Don't bounce fully, just lose some speed but keep going
+                         p.vx *= 0.98; 
+                         p.vy *= 0.9; 
+                         createParticles(p.x, numY, 40, '#fff'); // Big explosion
+                         createParticles(p.x, numY, 20, num.color);
+                         cameraRef.current.shake = 40;
+                         // No position correction (tunnel through)
+                         
+                         // Bonus Score for Smash
+                         setStats(prev => ({
+                            ...prev,
+                            score: prev.score + 500
+                         }));
+                    } else {
+                        // Bounce off the target
+                        // Simple bounce: invert Y and add some lift
+                        p.vy = -Math.abs(p.vy) * playerStatsRef.current.bounciness;
+                        p.vy -= 2; // Extra pop
+                        
+                        // Prevent sinking into the ball
+                        const overlap = minDist - dist;
+                        p.y -= overlap; // Push out
+
+                        // Friction
+                        // Reduced friction to keep momentum (was max(0.5, ...))
+                        const friction = Math.max(0.8, 1 - (resistance / (impactForce * 5)));
+                        p.vx *= friction;
+                        p.vr = p.vx * 0.1;
+                    }
 
                     // Effects
-                    createParticles(p.x, numY, 10, num.color);
-                    cameraRef.current.shake = Math.min(impactForce / 5, 20);
+                    if (!isSmash) {
+                        createParticles(p.x, numY, 10, num.color);
+                        cameraRef.current.shake = Math.min(impactForce / 5, 20);
+                        createFloatingText(p.x, p.y - 30, `+${num.value * 10}`, '#fbbf24', 20);
+                        soundManager.playTargetHit(num.type === 'BOOST' ? 'boost' : num.type === 'COIN' ? 'coin' : num.type === 'BLOCK' ? 'block' : 'normal');
+                    } else {
+                        createFloatingText(p.x, p.y - 50, "SMASH!", '#ef4444', 40);
+                        createFloatingText(p.x, p.y - 20, `+500`, '#fbbf24', 30);
+                        soundManager.playTargetHit('block'); // Heavy smash sound
+                    }
 
                     // Stats
                     setStats(prev => {
                         const newCombo = prev.combo + 1;
                         const comboMultiplier = 1 + (newCombo * 0.1);
+                        
+                        // Combo Text
+                        if (newCombo > 1) {
+                             createFloatingText(p.x + 50, p.y - 50, `${newCombo}x COMBO`, '#818cf8', 24);
+                        }
+
                         return {
                             ...prev,
                             skips: prev.skips + 1,
@@ -241,6 +374,9 @@ export default function GameCanvas() {
                     if (num.type === 'BOOST') {
                         p.vx *= 1.5;
                         p.vy -= 5; 
+                        createFloatingText(p.x, p.y - 80, "BOOST!", '#4ade80', 30);
+                    } else if (num.type === 'COIN') {
+                        createFloatingText(p.x, p.y - 40, "+$10", '#fbbf24', 24);
                     }
 
                     num.sunk = true;
@@ -252,6 +388,7 @@ export default function GameCanvas() {
                     createParticles(p.x, numY, 20, '#fff');
                     cameraRef.current.shake = 10;
                     setStats(prev => ({ ...prev, combo: 0 }));
+                    soundManager.playGameOver();
                 }
                 break; // Only hit one target per frame
             }
@@ -274,6 +411,7 @@ export default function GameCanvas() {
                  
                  createParticles(p.x, surfaceY, 15, '#3b82f6'); // Blue splash
                  cameraRef.current.shake = 5;
+                 soundManager.playWaterSkip();
                  
                  // Reset combo on water hit (penalty)
                  setStats(prev => ({ ...prev, combo: 0 }));
@@ -302,6 +440,7 @@ export default function GameCanvas() {
                  p.vx *= 0.5;
                  p.vy = 2;
                  setStats(prev => ({ ...prev, combo: 0 }));
+                 soundManager.playGameOver();
              }
         }
       }
@@ -323,6 +462,29 @@ export default function GameCanvas() {
       }
     }
 
+    // --- CAMERA & SHAKE (Always Active) ---
+    // Camera Follow X
+    const targetCamX = playerRef.current.x - 200;
+    cameraRef.current.x += (targetCamX - cameraRef.current.x) * 0.1;
+    if (cameraRef.current.x < 0) cameraRef.current.x = 0;
+
+    // Camera Follow Y
+    const screenY = playerRef.current.y - cameraRef.current.y;
+    const topMargin = CANVAS_HEIGHT * 0.3;
+    
+    if (screenY < topMargin) {
+        cameraRef.current.y += (screenY - topMargin) * 0.2;
+    } else if (screenY > CANVAS_HEIGHT * 0.6 && cameraRef.current.y < 0) {
+        cameraRef.current.y += (screenY - CANVAS_HEIGHT * 0.6) * 0.1;
+        if (cameraRef.current.y > 0) cameraRef.current.y = 0;
+    }
+
+    // Shake Decay
+    if (cameraRef.current.shake > 0) {
+        cameraRef.current.shake *= 0.9;
+        if (cameraRef.current.shake < 0.5) cameraRef.current.shake = 0;
+    }
+
     // --- PARTICLES ---
     particlesRef.current.forEach(part => {
         part.x += part.vx;
@@ -332,17 +494,51 @@ export default function GameCanvas() {
     });
     particlesRef.current = particlesRef.current.filter(p => p.life > 0);
 
+    // --- FLOATING TEXT ---
+    floatingTextsRef.current.forEach(ft => {
+        ft.y += ft.vy;
+        ft.vy *= 0.95; // Drag
+        ft.life -= 0.015;
+    });
+    floatingTextsRef.current = floatingTextsRef.current.filter(ft => ft.life > 0);
+
 
     // --- RENDER ---
-    // Background (Infinite)
-    ctx.fillStyle = '#1e1b4b'; // Indigo-950
+    // Clear Canvas
+    ctx.fillStyle = '#0f172a'; // Slate-900 (Base Sky)
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-    // Grid/Stars (Parallax)
-    ctx.fillStyle = '#312e81';
-    for(let i=0; i<CANVAS_WIDTH; i+=100) {
-        ctx.fillRect((i - (cameraRef.current.x * 0.5) % 100), 0, 1, CANVAS_HEIGHT);
+    // Dynamic Background (Parallax)
+    const camX = cameraRef.current.x;
+    
+    // Stars
+    ctx.save();
+    ctx.translate(-camX * 0.05, 0); // Very slow parallax
+    ctx.fillStyle = '#fff';
+    for(let i=0; i<50; i++) {
+        const x = (i * 137) % CANVAS_WIDTH;
+        const y = (i * 73) % (CANVAS_HEIGHT/2);
+        const size = (i % 3) === 0 ? 2 : 1;
+        ctx.globalAlpha = 0.3 + Math.sin(timeRef.current + i)*0.2;
+        ctx.beginPath();
+        ctx.arc(x, y, size, 0, Math.PI*2);
+        ctx.fill();
     }
+    ctx.restore();
+
+    // Distant Mountains
+    ctx.save();
+    ctx.translate(-camX * 0.2, 100); // Slow parallax
+    ctx.fillStyle = '#1e293b'; // Slate-800
+    ctx.beginPath();
+    ctx.moveTo(-100, CANVAS_HEIGHT);
+    for(let i=0; i<=CANVAS_WIDTH+200; i+=100) {
+        const h = 100 + Math.sin(i * 0.01) * 50;
+        ctx.lineTo(i, CANVAS_HEIGHT - h);
+    }
+    ctx.lineTo(CANVAS_WIDTH+200, CANVAS_HEIGHT);
+    ctx.fill();
+    ctx.restore();
 
     ctx.save();
     // Apply Shake and Camera
@@ -352,43 +548,71 @@ export default function GameCanvas() {
     // Smooth camera Y
     const camY = Math.min(0, cameraRef.current.y); // Ensure it never goes positive (below water)
     
-    ctx.translate(-cameraRef.current.x + shakeX, -camY + shakeY);
+    // Round translation to prevent sub-pixel jitter
+    ctx.translate(Math.floor(-cameraRef.current.x + shakeX), Math.floor(-camY + shakeY));
 
-    // Water/Surface Line (Wavy)
+    // Water Surface (Dynamic Waves)
     const surfaceY = CANVAS_HEIGHT - SURFACE_Y_OFFSET;
     
-    // Draw Water Block (Extend infinitely down)
+    // Back Wave (Darker)
+    ctx.fillStyle = '#1e3a8a'; // Blue-900
     ctx.beginPath();
-    ctx.moveTo(cameraRef.current.x, surfaceY);
-    
-    // Draw waves
-    for (let x = cameraRef.current.x; x < cameraRef.current.x + CANVAS_WIDTH; x += 20) {
-        const waveY = surfaceY + Math.sin((x * 0.01) + timeRef.current) * 5;
-        ctx.lineTo(x, waveY);
+    ctx.moveTo(cameraRef.current.x - 100, CANVAS_HEIGHT + 500);
+    for(let x = cameraRef.current.x - 100; x <= cameraRef.current.x + CANVAS_WIDTH + 100; x+=50) {
+         const waveH = Math.sin((x) * 0.01 + timeRef.current) * 10;
+         ctx.lineTo(x, surfaceY + 10 + waveH);
     }
-    
-    // Extend way down to cover any camera movement
-    ctx.lineTo(cameraRef.current.x + CANVAS_WIDTH, CANVAS_HEIGHT + 2000); 
-    ctx.lineTo(cameraRef.current.x, CANVAS_HEIGHT + 2000);
-    ctx.closePath();
-    
-    // Water gradient
+    ctx.lineTo(cameraRef.current.x + CANVAS_WIDTH + 100, CANVAS_HEIGHT + 500);
+    ctx.fill();
+
+    // Front Wave (Lighter)
     const grad = ctx.createLinearGradient(0, surfaceY, 0, CANVAS_HEIGHT + 500);
-    grad.addColorStop(0, 'rgba(79, 70, 229, 0.4)');
-    grad.addColorStop(1, 'rgba(79, 70, 229, 0.9)');
+    grad.addColorStop(0, 'rgba(59, 130, 246, 0.8)'); // Blue-500
+    grad.addColorStop(1, 'rgba(30, 58, 138, 0.9)'); // Blue-900
     ctx.fillStyle = grad;
+    
+    ctx.beginPath();
+    ctx.moveTo(cameraRef.current.x - 100, CANVAS_HEIGHT + 500);
+    for(let x = cameraRef.current.x - 100; x <= cameraRef.current.x + CANVAS_WIDTH + 100; x+=30) {
+         const waveH = Math.sin((x) * 0.02 + timeRef.current * 1.5) * 5;
+         ctx.lineTo(x, surfaceY + waveH);
+    }
+    ctx.lineTo(cameraRef.current.x + CANVAS_WIDTH + 100, CANVAS_HEIGHT + 500);
     ctx.fill();
     
-    // Water Top Line
-    ctx.beginPath();
-    for (let x = cameraRef.current.x; x < cameraRef.current.x + CANVAS_WIDTH; x += 20) {
-        const waveY = surfaceY + Math.sin((x * 0.01) + timeRef.current) * 5;
-        if (x === cameraRef.current.x) ctx.moveTo(x, waveY);
-        else ctx.lineTo(x, waveY);
-    }
-    ctx.strokeStyle = '#818cf8'; // Indigo-400
+    // Top Line
+    ctx.strokeStyle = '#60a5fa'; // Blue-400
     ctx.lineWidth = 2;
+    ctx.beginPath();
+    for(let x = cameraRef.current.x - 100; x <= cameraRef.current.x + CANVAS_WIDTH + 100; x+=30) {
+         const waveH = Math.sin((x) * 0.02 + timeRef.current * 1.5) * 5;
+         if (x === cameraRef.current.x - 100) ctx.moveTo(x, surfaceY + waveH);
+         else ctx.lineTo(x, surfaceY + waveH);
+    }
     ctx.stroke();
+
+    // Draw Start Plank
+    const plankX = 100;
+    const plankY = CANVAS_HEIGHT - SURFACE_Y_OFFSET;
+    if (cameraRef.current.x < plankX + 200) {
+        ctx.save();
+        // ctx.translate(-cameraRef.current.x + shakeX, -camY + shakeY); // Already translated
+        
+        // Plank Legs
+        ctx.fillStyle = '#78350f'; // Amber-900
+        ctx.fillRect(plankX - 50, plankY, 10, 100);
+        ctx.fillRect(plankX + 50, plankY, 10, 100);
+        
+        // Plank Top
+        ctx.fillStyle = '#92400e'; // Amber-700
+        ctx.fillRect(plankX - 70, plankY - 10, 160, 15);
+        
+        // Detail
+        ctx.fillStyle = '#b45309'; // Amber-600
+        ctx.fillRect(plankX - 70, plankY - 10, 160, 3);
+        
+        ctx.restore();
+    }
 
     // Surface Numbers
     surfaceRef.current.forEach(num => {
@@ -397,7 +621,20 @@ export default function GameCanvas() {
         ctx.beginPath();
         // Bobbing effect
         const bobY = Math.sin(timeRef.current + num.x) * 3;
-        const drawY = num.sunk ? surfaceY + 40 : surfaceY + bobY; 
+        let drawY = num.sunk ? surfaceY + 40 : surfaceY + bobY; 
+        
+        // Moving effect
+        if (num.isMoving && !num.sunk) {
+            drawY += Math.sin(timeRef.current * 2 + num.x) * (num.moveRange || 50);
+        }
+
+        // Ghost effect
+        if (num.type === 'GHOST' && !num.sunk) {
+            const ghostOpacity = 0.5 + Math.sin(timeRef.current * 3 + num.x) * 0.4;
+            ctx.globalAlpha = ghostOpacity;
+        } else {
+            ctx.globalAlpha = 1;
+        }
         
         ctx.arc(num.x, drawY, num.radius, 0, Math.PI * 2);
         ctx.fillStyle = num.sunk ? '#475569' : num.color;
@@ -412,6 +649,20 @@ export default function GameCanvas() {
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillText(num.value.toString(), num.x, drawY);
+
+            // Multi-Hit Indicator
+            if (num.type === 'MULTI_HIT' && (num.hitsRequired || 0) > 1) {
+                ctx.fillStyle = '#fff';
+                ctx.font = 'bold 10px "Inter"';
+                ctx.fillText(`${num.hitsRequired} HP`, num.x, drawY + 15);
+                
+                // Draw health ring
+                ctx.beginPath();
+                ctx.arc(num.x, drawY, num.radius - 2, 0, Math.PI * 2);
+                ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+            }
 
             // DEBUG: Draw Hitbox
             ctx.strokeStyle = 'rgba(255, 0, 0, 0.3)';
@@ -467,6 +718,25 @@ export default function GameCanvas() {
         ctx.arc(part.x, part.y, part.size, 0, Math.PI * 2);
         ctx.fill();
         ctx.globalAlpha = 1;
+    });
+
+    // Floating Text
+    floatingTextsRef.current.forEach(ft => {
+        ctx.save();
+        ctx.globalAlpha = ft.life;
+        ctx.translate(ft.x, ft.y);
+        // Scale up slightly as it fades
+        const scale = 1 + (1 - ft.life) * 0.5;
+        ctx.scale(scale, scale);
+        
+        ctx.fillStyle = ft.color;
+        ctx.shadowColor = 'rgba(0,0,0,0.5)';
+        ctx.shadowBlur = 4;
+        ctx.font = `bold ${ft.size}px "Inter"`;
+        ctx.textAlign = 'center';
+        ctx.fillText(ft.text, 0, 0);
+        
+        ctx.restore();
     });
 
     // Aim Line (Arrow)
@@ -713,6 +983,7 @@ export default function GameCanvas() {
     if (playerRef.current.vx < 2) playerRef.current.vx = 2;
     
     setGameState('FLYING');
+    soundManager.playLaunch();
   }, []);
 
   // Input Handlers
@@ -722,6 +993,7 @@ export default function GameCanvas() {
         playerRef.current.vy += 15; // Smash down
         createParticles(playerRef.current.x, playerRef.current.y, 10, '#fff');
         setDiveEffect({ x: playerRef.current.x, y: playerRef.current.y, id: Date.now() });
+        soundManager.playDive();
         setTimeout(() => setDiveEffect(null), 500);
         return;
     }
@@ -791,6 +1063,10 @@ export default function GameCanvas() {
               ...playerStatsRef.current,
               [type]: playerStatsRef.current[type] + increment
           };
+          // Visual update for weight
+          if (type === 'weight') {
+             playerRef.current.radius = 20 + (playerStatsRef.current.weight * 5);
+          }
           forceUpdate(n => n + 1);
       }
   };
@@ -947,8 +1223,15 @@ export default function GameCanvas() {
                                   <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fbbf24" strokeWidth="2"><circle cx="12" cy="12" r="10"/><path d="m16 12-4-4-4 4"/><path d="M12 16V8"/></svg>
                               </div>
                               <div>
-                                  <div className="text-white font-bold text-sm">SKIP</div>
-                                  <div className="text-xs text-slate-400">Hit targets to bounce and gain speed. Green targets give a BOOST. Avoid Red blocks early on!</div>
+                                  <div className="text-white font-bold text-sm">TARGET VALUES</div>
+                                  <div className="text-xs text-slate-400 mt-1">
+                                      The number on the ball is its <b>POINT VALUE</b>.
+                                      <ul className="list-disc list-inside mt-1 space-y-1">
+                                          <li><b>Hit a target:</b> Value × 10 points.</li>
+                                          <li><b>Combo:</b> Hitting targets in a row multiplies your score!</li>
+                                          <li><b>Total Score:</b> All points add up at the end of the run.</li>
+                                      </ul>
+                                  </div>
                               </div>
                           </div>
 
@@ -957,16 +1240,30 @@ export default function GameCanvas() {
                                   <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#f472b6" strokeWidth="2"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>
                               </div>
                               <div>
-                                  <div className="text-white font-bold text-sm">DIVE</div>
-                                  <div className="text-xs text-slate-400">Click mid-air to smash down. Use this to hit a target you might fly over.</div>
+                                  <div className="text-white font-bold text-sm">WHAT IS A "SKIP"?</div>
+                                  <div className="text-xs text-slate-400 mt-1">
+                                      Just like skipping a stone on a lake!
+                                      <ul className="list-disc list-inside mt-1 space-y-1">
+                                          <li><b>Water Skip:</b> Bounce off the water surface (needs Speed!).</li>
+                                          <li><b>Target Skip:</b> Bounce off a target ball to stay airborne.</li>
+                                          <li><b>Goal:</b> Skip as many times as possible to travel further!</li>
+                                      </ul>
+                                  </div>
                               </div>
                           </div>
                       </div>
 
                       <div className="space-y-4">
-                          <h3 className="text-indigo-400 font-bold uppercase tracking-wider text-sm border-b border-slate-700 pb-2">Advanced</h3>
+                          <h3 className="text-indigo-400 font-bold uppercase tracking-wider text-sm border-b border-slate-700 pb-2">Target Types</h3>
+                          
+                          <div className="text-xs text-slate-400 space-y-2">
+                              <div className="flex items-center gap-2"><span className="w-3 h-3 rounded-full bg-green-400 shadow-[0_0_10px_rgba(74,222,128,0.5)]"></span> <div><span className="text-green-400 font-bold">BOOST</span><br/>Explosive speed boost! Aim for these.</div></div>
+                              <div className="flex items-center gap-2"><span className="w-3 h-3 rounded-full bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.5)]"></span> <div><span className="text-amber-400 font-bold">COIN</span><br/>Gives you currency ($10) to buy upgrades.</div></div>
+                              <div className="flex items-center gap-2"><span className="w-3 h-3 rounded-full bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.5)]"></span> <div><span className="text-red-500 font-bold">BLOCK</span><br/>Heavy & Slow. Avoid unless you have high MASS to smash them!</div></div>
+                              <div className="flex items-center gap-2"><span className="w-3 h-3 rounded-full bg-indigo-400 shadow-[0_0_10px_rgba(129,140,248,0.5)]"></span> <div><span className="text-indigo-400 font-bold">NORMAL</span><br/>Standard bounce. Good for combos.</div></div>
+                          </div>
 
-                          <div className="flex gap-3">
+                          <div className="flex gap-3 mt-4 pt-4 border-t border-slate-700">
                               <div className="bg-blue-900/30 p-2 rounded h-fit shrink-0">
                                   <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" strokeWidth="2"><path d="M2 12h20"/><path d="M2 16c5-5 15 5 20 0"/></svg>
                               </div>
@@ -1025,7 +1322,28 @@ export default function GameCanvas() {
                   <h1 className="text-6xl font-black text-white mb-2 font-sans tracking-tighter italic transform -skew-x-6">
                       NUMBER<br/><span className="text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-cyan-400">SKIPPER</span>
                   </h1>
-                  <p className="text-slate-400 mb-8 text-lg">Drag, aim, and skip your way to infinity.</p>
+                  <p className="text-slate-400 mb-6 text-lg">Drag, aim, and skip your way to infinity.</p>
+                  
+                  {/* Lifetime Stats */}
+                  <div className="grid grid-cols-2 gap-4 mb-8 text-left bg-slate-800/50 p-4 rounded-xl border border-white/5">
+                      <div>
+                          <div className="text-xs text-slate-500 uppercase tracking-widest">High Score</div>
+                          <div className="text-xl font-mono font-bold text-white">{lifetimeStats.highScore.toLocaleString()}</div>
+                      </div>
+                      <div>
+                          <div className="text-xs text-slate-500 uppercase tracking-widest">Max Dist</div>
+                          <div className="text-xl font-mono font-bold text-white">{lifetimeStats.maxDistance.toLocaleString()}m</div>
+                      </div>
+                      <div>
+                          <div className="text-xs text-slate-500 uppercase tracking-widest">Total Skips</div>
+                          <div className="text-xl font-mono font-bold text-white">{lifetimeStats.totalSkips.toLocaleString()}</div>
+                      </div>
+                      <div>
+                          <div className="text-xs text-slate-500 uppercase tracking-widest">Total Dist</div>
+                          <div className="text-xl font-mono font-bold text-white">{(lifetimeStats.totalDistance / 1000).toFixed(1)}km</div>
+                      </div>
+                  </div>
+
                   <button 
                     onClick={resetRun}
                     className="group relative px-8 py-4 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold text-xl transition-all shadow-[0_0_20px_rgba(79,70,229,0.5)] hover:shadow-[0_0_30px_rgba(79,70,229,0.7)] hover:-translate-y-1"
@@ -1039,116 +1357,119 @@ export default function GameCanvas() {
 
       {/* Game Over / Shop */}
       {gameState === 'GAME_OVER' && (
-          <div className="absolute inset-0 bg-black/80 flex items-center justify-center backdrop-blur-sm z-20">
-              <div className="bg-slate-900 p-8 rounded-2xl border border-slate-700 shadow-2xl max-w-3xl w-full animate-in fade-in slide-in-from-bottom-8 duration-300">
-                  <div className="text-center mb-8">
-                      <h2 className="text-3xl font-bold text-white mb-2">RUN COMPLETE</h2>
-                      <p className="text-slate-400 mb-6">
-                          {stats.distance < 50 ? "Too slow! Upgrade your POWER." : 
-                           stats.skips < 5 ? "Aim for the numbers to keep going!" : 
-                           "Great run! Buy upgrades to go further."}
-                      </p>
-                      <div className="flex justify-center gap-12 mt-6">
+          <div className="absolute inset-0 bg-black/90 flex items-center justify-center backdrop-blur-md z-20">
+              <div className="bg-slate-900 p-8 rounded-2xl border border-slate-700 shadow-2xl max-w-5xl w-full animate-in fade-in slide-in-from-bottom-8 duration-300 flex flex-col gap-6 max-h-[90vh] overflow-y-auto">
+                  
+                  {/* Header */}
+                  <div className="text-center">
+                      <h2 className="text-4xl font-black text-white mb-2 tracking-tight">RUN COMPLETE</h2>
+                      {stats.score > 0 && stats.score >= lifetimeStats.highScore && (
+                          <div className="text-amber-400 font-bold text-lg animate-pulse mb-4">NEW HIGH SCORE!</div>
+                      )}
+                      <div className="flex justify-center gap-12 mt-6 p-4 bg-slate-800/50 rounded-2xl border border-white/5">
                           <div className="text-center">
                               <div className="text-xs text-slate-500 uppercase tracking-widest mb-1">Distance</div>
                               <div className="text-4xl font-mono font-bold text-white">{stats.distance}m</div>
                           </div>
                           <div className="text-center">
-                              <div className="text-xs text-slate-500 uppercase tracking-widest mb-1">Total Skips</div>
+                              <div className="text-xs text-slate-500 uppercase tracking-widest mb-1">Skips</div>
                               <div className="text-4xl font-mono font-bold text-indigo-400">{stats.skips}</div>
                           </div>
                           <div className="text-center">
                               <div className="text-xs text-slate-500 uppercase tracking-widest mb-1">Earnings</div>
-                              <div className="text-4xl font-mono font-bold text-amber-400">+${stats.score > 0 ? Math.floor(stats.score/100) : 0}</div>
+                              <div className="text-4xl font-mono font-bold text-amber-400">+${stats.currency}</div>
                           </div>
                       </div>
                   </div>
 
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
-                      <UpgradeCard 
-                        title="MASS" 
-                        desc="Increases impact force to crush numbers."
-                        value={playerStatsRef.current.value} 
-                        cost={Math.floor(playerStatsRef.current.value * 10)} 
-                        canAfford={stats.currency >= Math.floor(playerStatsRef.current.value * 10)}
-                        onBuy={() => buyUpgrade('value', Math.floor(playerStatsRef.current.value * 10), 5)}
-                      />
-                      <UpgradeCard 
-                        title="AERO" 
-                        desc="Reduces air resistance for longer flights."
-                        value={Math.round(playerStatsRef.current.aerodynamics * 1000)} 
-                        cost={500} 
-                        canAfford={stats.currency >= 500 && playerStatsRef.current.aerodynamics < 0.999}
-                        onBuy={() => buyUpgrade('aerodynamics', 500, 0.001)}
-                        maxed={playerStatsRef.current.aerodynamics >= 0.999}
-                      />
-                      <UpgradeCard 
-                        title="BOUNCE" 
-                        desc="Retain more velocity after skipping."
-                        value={Math.round(playerStatsRef.current.bounciness * 100)} 
-                        cost={250} 
-                        canAfford={stats.currency >= 250 && playerStatsRef.current.bounciness < 0.95}
-                        onBuy={() => buyUpgrade('bounciness', 250, 0.05)}
-                        maxed={playerStatsRef.current.bounciness >= 0.95}
-                      />
-                      <UpgradeCard 
-                        title="POWER" 
-                        desc="Maximum launch velocity."
-                        value={playerStatsRef.current.maxPower} 
-                        cost={Math.floor(playerStatsRef.current.maxPower * 5)} 
-                        canAfford={stats.currency >= Math.floor(playerStatsRef.current.maxPower * 5)}
-                        onBuy={() => buyUpgrade('maxPower', Math.floor(playerStatsRef.current.maxPower * 5), 2)}
-                      />
+                  {/* Shop Grid */}
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                      {/* MASS */}
+                      <button 
+                        onClick={() => buyUpgrade('weight', 100, 0.2)}
+                        disabled={stats.currency < 100}
+                        className="bg-slate-800 p-5 rounded-xl border border-slate-700 hover:border-indigo-500 transition-all disabled:opacity-50 disabled:hover:border-slate-700 group text-left relative overflow-hidden flex flex-col h-full"
+                      >
+                          <div className="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition-opacity">
+                              <svg width="80" height="80" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>
+                          </div>
+                          <div className="flex justify-between items-start mb-2">
+                              <div className="text-indigo-400 font-bold text-sm tracking-wider">MASS</div>
+                              <div className="bg-slate-900 px-2 py-1 rounded text-xs font-mono text-slate-400">LVL {Math.round(playerStatsRef.current.weight * 5)}</div>
+                          </div>
+                          <p className="text-xs text-slate-400 mb-4 flex-grow">Increase size to SMASH through blocks without stopping.</p>
+                          <div className={`text-lg font-bold ${stats.currency >= 100 ? 'text-amber-400' : 'text-slate-600'}`}>
+                              $100
+                          </div>
+                      </button>
+
+                      {/* AERO */}
+                      <button 
+                        onClick={() => buyUpgrade('aerodynamics', 500, 0.001)}
+                        disabled={stats.currency < 500}
+                        className="bg-slate-800 p-5 rounded-xl border border-slate-700 hover:border-sky-500 transition-all disabled:opacity-50 disabled:hover:border-slate-700 group text-left relative overflow-hidden flex flex-col h-full"
+                      >
+                          <div className="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition-opacity">
+                              <svg width="80" height="80" viewBox="0 0 24 24" fill="currentColor"><path d="M2 12h20"/><path d="M19 12l-7-7"/><path d="M19 12l-7 7"/></svg>
+                          </div>
+                          <div className="flex justify-between items-start mb-2">
+                              <div className="text-sky-400 font-bold text-sm tracking-wider">AERO</div>
+                              <div className="bg-slate-900 px-2 py-1 rounded text-xs font-mono text-slate-400">LVL {Math.round((playerStatsRef.current.aerodynamics - 0.9) * 1000)}</div>
+                          </div>
+                          <p className="text-xs text-slate-400 mb-4 flex-grow">Reduce air resistance to fly further and faster.</p>
+                          <div className={`text-lg font-bold ${stats.currency >= 500 ? 'text-amber-400' : 'text-slate-600'}`}>
+                              $500
+                          </div>
+                      </button>
+
+                      {/* BOUNCE */}
+                      <button 
+                        onClick={() => buyUpgrade('bounciness', 250, 0.05)}
+                        disabled={stats.currency < 250}
+                        className="bg-slate-800 p-5 rounded-xl border border-slate-700 hover:border-emerald-500 transition-all disabled:opacity-50 disabled:hover:border-slate-700 group text-left relative overflow-hidden flex flex-col h-full"
+                      >
+                          <div className="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition-opacity">
+                              <svg width="80" height="80" viewBox="0 0 24 24" fill="currentColor"><path d="M12 5v14"/><path d="m19 12-7 7-7-7"/></svg>
+                          </div>
+                          <div className="flex justify-between items-start mb-2">
+                              <div className="text-emerald-400 font-bold text-sm tracking-wider">BOUNCE</div>
+                              <div className="bg-slate-900 px-2 py-1 rounded text-xs font-mono text-slate-400">LVL {Math.round(playerStatsRef.current.bounciness * 100)}</div>
+                          </div>
+                          <p className="text-xs text-slate-400 mb-4 flex-grow">Retain more velocity after hitting targets.</p>
+                          <div className={`text-lg font-bold ${stats.currency >= 250 ? 'text-amber-400' : 'text-slate-600'}`}>
+                              $250
+                          </div>
+                      </button>
+
+                      {/* POWER */}
+                      <button 
+                        onClick={() => buyUpgrade('maxPower', 125, 2)}
+                        disabled={stats.currency < 125}
+                        className="bg-slate-800 p-5 rounded-xl border border-slate-700 hover:border-rose-500 transition-all disabled:opacity-50 disabled:hover:border-slate-700 group text-left relative overflow-hidden flex flex-col h-full"
+                      >
+                          <div className="absolute top-0 right-0 p-2 opacity-10 group-hover:opacity-20 transition-opacity">
+                              <svg width="80" height="80" viewBox="0 0 24 24" fill="currentColor"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+                          </div>
+                          <div className="flex justify-between items-start mb-2">
+                              <div className="text-rose-400 font-bold text-sm tracking-wider">POWER</div>
+                              <div className="bg-slate-900 px-2 py-1 rounded text-xs font-mono text-slate-400">LVL {playerStatsRef.current.maxPower}</div>
+                          </div>
+                          <p className="text-xs text-slate-400 mb-4 flex-grow">Increase maximum launch velocity.</p>
+                          <div className={`text-lg font-bold ${stats.currency >= 125 ? 'text-amber-400' : 'text-slate-600'}`}>
+                              $125
+                          </div>
+                      </button>
                   </div>
 
-                  <div className="flex justify-center">
-                    <button 
-                        onClick={resetRun}
-                        className="px-12 py-4 bg-white text-slate-900 hover:bg-indigo-50 rounded-xl font-bold text-xl transition-colors shadow-lg"
-                    >
-                        PLAY AGAIN
-                    </button>
-                  </div>
+                  <button 
+                      onClick={resetRun}
+                      className="w-full py-4 bg-white hover:bg-slate-200 text-slate-900 rounded-xl font-black text-xl tracking-wide transition-colors shadow-lg mt-2"
+                  >
+                      PLAY AGAIN
+                  </button>
               </div>
           </div>
       )}
     </div>
   );
-}
-
-interface UpgradeCardProps {
-    title: string;
-    desc: string;
-    value: number;
-    cost: number;
-    canAfford: boolean;
-    onBuy: () => void;
-    maxed?: boolean;
-}
-
-function UpgradeCard({ title, desc, value, cost, canAfford, onBuy, maxed = false }: UpgradeCardProps) {
-    return (
-        <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-col justify-between group hover:border-slate-600 transition-colors">
-            <div>
-                <div className="flex justify-between items-center mb-2">
-                    <h3 className="font-bold text-white font-mono">{title}</h3>
-                    <span className="text-[10px] font-mono bg-slate-700 px-1.5 py-0.5 rounded text-slate-300">LVL {value}</span>
-                </div>
-                <p className="text-xs text-slate-400 mb-4 leading-relaxed h-10">{desc}</p>
-            </div>
-            <button 
-                onClick={onBuy}
-                disabled={!canAfford || maxed}
-                className={`w-full py-3 rounded-lg font-bold text-sm flex justify-center items-center gap-2 transition-all
-                    ${maxed 
-                        ? 'bg-slate-700 text-slate-500 cursor-not-allowed' 
-                        : canAfford 
-                            ? 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-900/20 active:scale-95' 
-                            : 'bg-slate-700 text-slate-500 opacity-50 cursor-not-allowed'
-                    }`}
-            >
-                {maxed ? 'MAXED' : <>{cost} <span className="text-amber-400">$</span></>}
-            </button>
-        </div>
-    );
 }

@@ -27,8 +27,17 @@ export interface SurfaceNumber {
   weight: number;
   radius: number;
   color: string;
-  type: 'NORMAL' | 'BOOST' | 'BLOCK' | 'COIN';
+  type: 'NORMAL' | 'BOOST' | 'BLOCK' | 'COIN' | 'MULTI_HIT' | 'MOVING' | 'GHOST';
   sunk: boolean;
+  
+  // New Properties
+  hitsRequired?: number;
+  maxHits?: number;
+  isMoving?: boolean;
+  moveSpeed?: number;
+  moveRange?: number;
+  initialY?: number;
+  opacity?: number; // For Ghost
 }
 
 export interface Particle {
@@ -40,4 +49,13 @@ export interface Particle {
   life: number;
   color: string;
   size: number;
+}
+
+export interface LifetimeStats {
+  totalDistance: number;
+  totalSkips: number;
+  totalScore: number;
+  highScore: number;
+  maxDistance: number;
+  gamesPlayed: number;
 }
